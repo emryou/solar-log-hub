@@ -27,7 +27,9 @@ RUN echo '{ \
     "cors": "^2.8.5", \
     "sqlite3": "^5.1.6", \
     "ws": "^8.14.2", \
-    "dotenv": "^16.3.1" \
+    "dotenv": "^16.3.1", \
+    "bcryptjs": "^2.4.3", \
+    "jsonwebtoken": "^9.0.2" \
   }, \
   "engines": { \
     "node": ">=18.0.0" \

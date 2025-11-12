@@ -27,15 +27,43 @@ class Database {
 
   async createTables() {
     const tables = [
-      // Devices table
+      // Organizations (companies/customers)
+      `CREATE TABLE IF NOT EXISTS organizations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        contact_email TEXT,
+        contact_phone TEXT,
+        address TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`,
+      
+      // Users table
+      `CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        full_name TEXT,
+        role TEXT NOT NULL DEFAULT 'user',
+        organization_id INTEGER NOT NULL,
+        is_active INTEGER DEFAULT 1,
+        last_login DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+        CHECK (role IN ('admin', 'user', 'viewer'))
+      )`,
+      
+      // Devices table (with organization_id)
       `CREATE TABLE IF NOT EXISTS devices (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL,
+        organization_id INTEGER NOT NULL,
         ip_address TEXT,
         description TEXT,
         is_active INTEGER DEFAULT 1,
         last_seen DATETIME,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
       )`,
       
       // Sensor data table
@@ -101,6 +129,45 @@ class Database {
         [key, value, description]
       );
     }
+    
+    // Create default admin user and organization
+    await this.createDefaultAdmin();
+  }
+
+  async createDefaultAdmin() {
+    const bcrypt = require('bcryptjs');
+    
+    // Check if admin exists
+    const existingAdmin = await this.get(
+      `SELECT id FROM users WHERE role = 'admin' LIMIT 1`
+    );
+    
+    if (!existingAdmin) {
+      // Create default organization
+      await this.run(
+        `INSERT OR IGNORE INTO organizations (name, contact_email) 
+         VALUES (?, ?)`,
+        ['System Admin', 'admin@solar-monitor.local']
+      );
+      
+      const org = await this.get(
+        `SELECT id FROM organizations WHERE name = 'System Admin'`
+      );
+      
+      // Create admin user (password: admin123)
+      const passwordHash = await bcrypt.hash('admin123', 10);
+      
+      await this.run(
+        `INSERT OR IGNORE INTO users (email, password_hash, full_name, role, organization_id) 
+         VALUES (?, ?, ?, ?, ?)`,
+        ['admin@solar-monitor.local', passwordHash, 'System Administrator', 'admin', org.id]
+      );
+      
+      console.log('✅ Default admin created:');
+      console.log('   Email: admin@solar-monitor.local');
+      console.log('   Password: admin123');
+      console.log('   ⚠️  CHANGE THIS PASSWORD IMMEDIATELY!');
+    }
   }
 
   // Generic database operations
@@ -132,23 +199,121 @@ class Database {
   }
 
   // ============================================
+  // USERS
+  // ============================================
+
+  async createUser(email, passwordHash, fullName, role, organizationId) {
+    const result = await this.run(
+      `INSERT INTO users (email, password_hash, full_name, role, organization_id) 
+       VALUES (?, ?, ?, ?, ?)`,
+      [email, passwordHash, fullName, role, organizationId]
+    );
+    
+    return this.getUserById(result.id);
+  }
+
+  async getUserById(id) {
+    return this.get(
+      `SELECT u.*, o.name as organization_name 
+       FROM users u 
+       LEFT JOIN organizations o ON u.organization_id = o.id 
+       WHERE u.id = ?`,
+      [id]
+    );
+  }
+
+  async getUserByEmail(email) {
+    return this.get(
+      `SELECT u.*, o.name as organization_name 
+       FROM users u 
+       LEFT JOIN organizations o ON u.organization_id = o.id 
+       WHERE u.email = ?`,
+      [email]
+    );
+  }
+
+  async updateUserLastLogin(userId) {
+    return this.run(
+      `UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?`,
+      [userId]
+    );
+  }
+
+  async getAllUsers() {
+    return this.all(
+      `SELECT u.*, o.name as organization_name 
+       FROM users u 
+       LEFT JOIN organizations o ON u.organization_id = o.id 
+       ORDER BY u.created_at DESC`
+    );
+  }
+
+  // ============================================
+  // ORGANIZATIONS
+  // ============================================
+
+  async createOrganization(name, contactEmail, contactPhone, address) {
+    const result = await this.run(
+      `INSERT INTO organizations (name, contact_email, contact_phone, address) 
+       VALUES (?, ?, ?, ?)`,
+      [name, contactEmail, contactPhone, address]
+    );
+    
+    return this.getOrganizationById(result.id);
+  }
+
+  async getOrganizationById(id) {
+    return this.get(
+      `SELECT * FROM organizations WHERE id = ?`,
+      [id]
+    );
+  }
+
+  async getAllOrganizations() {
+    return this.all(
+      `SELECT o.*, 
+              (SELECT COUNT(*) FROM users WHERE organization_id = o.id) as user_count,
+              (SELECT COUNT(*) FROM devices WHERE organization_id = o.id) as device_count
+       FROM organizations o 
+       ORDER BY o.name ASC`
+    );
+  }
+
+  // ============================================
   // DEVICES
   // ============================================
 
-  async getAllDevices() {
+  async getAllDevices(organizationId = null) {
+    if (organizationId) {
+      return this.all(
+        `SELECT d.*, o.name as organization_name 
+         FROM devices d 
+         LEFT JOIN organizations o ON d.organization_id = o.id 
+         WHERE d.organization_id = ? 
+         ORDER BY d.name ASC`,
+        [organizationId]
+      );
+    }
+    
     return this.all(
-      `SELECT * FROM devices ORDER BY name ASC`
+      `SELECT d.*, o.name as organization_name 
+       FROM devices d 
+       LEFT JOIN organizations o ON d.organization_id = o.id 
+       ORDER BY d.name ASC`
     );
   }
 
   async getDeviceByName(name) {
     return this.get(
-      `SELECT * FROM devices WHERE name = ?`,
+      `SELECT d.*, o.name as organization_name 
+       FROM devices d 
+       LEFT JOIN organizations o ON d.organization_id = o.id 
+       WHERE d.name = ?`,
       [name]
     );
   }
 
-  async upsertDevice(name, ip_address = null, description = null) {
+  async upsertDevice(name, organizationId, ip_address = null, description = null) {
     const existing = await this.getDeviceByName(name);
     
     if (existing) {
@@ -161,10 +326,14 @@ class Database {
         [ip_address, description, name]
       );
     } else {
+      if (!organizationId) {
+        throw new Error('organization_id is required for new devices');
+      }
+      
       await this.run(
-        `INSERT INTO devices (name, ip_address, description) 
-         VALUES (?, ?, ?)`,
-        [name, ip_address, description]
+        `INSERT INTO devices (name, organization_id, ip_address, description) 
+         VALUES (?, ?, ?, ?)`,
+        [name, organizationId, ip_address, description]
       );
     }
     
@@ -201,26 +370,34 @@ class Database {
     );
   }
 
-  async getSensorData({ device_name, start_date, end_date, limit = 1000 }) {
-    let sql = `SELECT * FROM sensor_data WHERE 1=1`;
+  async getSensorData({ device_name, start_date, end_date, limit = 1000, organizationId = null }) {
+    let sql = `SELECT sd.*, d.organization_id 
+               FROM sensor_data sd 
+               LEFT JOIN devices d ON sd.device_name = d.name 
+               WHERE 1=1`;
     const params = [];
 
+    if (organizationId) {
+      sql += ` AND d.organization_id = ?`;
+      params.push(organizationId);
+    }
+
     if (device_name) {
-      sql += ` AND device_name = ?`;
+      sql += ` AND sd.device_name = ?`;
       params.push(device_name);
     }
 
     if (start_date) {
-      sql += ` AND timestamp >= ?`;
+      sql += ` AND sd.timestamp >= ?`;
       params.push(start_date);
     }
 
     if (end_date) {
-      sql += ` AND timestamp <= ?`;
+      sql += ` AND sd.timestamp <= ?`;
       params.push(end_date);
     }
 
-    sql += ` ORDER BY timestamp DESC LIMIT ?`;
+    sql += ` ORDER BY sd.timestamp DESC LIMIT ?`;
     params.push(limit);
 
     return this.all(sql, params);
@@ -236,36 +413,42 @@ class Database {
     );
   }
 
-  async getStatistics(device_name, start_date, end_date) {
+  async getStatistics(device_name, start_date, end_date, organizationId = null) {
     let sql = `
       SELECT 
         COUNT(*) as total_records,
-        AVG(radiation) as avg_radiation,
-        MAX(radiation) as max_radiation,
-        MIN(radiation) as min_radiation,
-        AVG(temperature1) as avg_temp1,
-        MAX(temperature1) as max_temp1,
-        MIN(temperature1) as min_temp1,
-        AVG(temperature2) as avg_temp2,
-        MAX(temperature2) as max_temp2,
-        MIN(temperature2) as min_temp2
-      FROM sensor_data 
+        AVG(sd.radiation) as avg_radiation,
+        MAX(sd.radiation) as max_radiation,
+        MIN(sd.radiation) as min_radiation,
+        AVG(sd.temperature1) as avg_temp1,
+        MAX(sd.temperature1) as max_temp1,
+        MIN(sd.temperature1) as min_temp1,
+        AVG(sd.temperature2) as avg_temp2,
+        MAX(sd.temperature2) as max_temp2,
+        MIN(sd.temperature2) as min_temp2
+      FROM sensor_data sd
+      LEFT JOIN devices d ON sd.device_name = d.name
       WHERE 1=1
     `;
     const params = [];
 
+    if (organizationId) {
+      sql += ` AND d.organization_id = ?`;
+      params.push(organizationId);
+    }
+
     if (device_name) {
-      sql += ` AND device_name = ?`;
+      sql += ` AND sd.device_name = ?`;
       params.push(device_name);
     }
 
     if (start_date) {
-      sql += ` AND timestamp >= ?`;
+      sql += ` AND sd.timestamp >= ?`;
       params.push(start_date);
     }
 
     if (end_date) {
-      sql += ` AND timestamp <= ?`;
+      sql += ` AND sd.timestamp <= ?`;
       params.push(end_date);
     }
 

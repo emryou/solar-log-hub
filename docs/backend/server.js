@@ -3,6 +3,15 @@ const cors = require('cors');
 const WebSocket = require('ws');
 const http = require('http');
 const { Database } = require('./database');
+const { 
+  hashPassword, 
+  comparePassword, 
+  generateToken, 
+  authMiddleware, 
+  adminMiddleware,
+  validateEmail,
+  validatePassword 
+} = require('./auth');
 
 const app = express();
 const server = http.createServer(app);
@@ -42,7 +51,7 @@ function broadcast(data) {
 // API ROUTES
 // ============================================
 
-// Health check
+// Health check (public)
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -52,13 +61,188 @@ app.get('/api/health', (req, res) => {
 });
 
 // ============================================
+// AUTHENTICATION
+// ============================================
+
+// Register new organization + user
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { 
+      email, 
+      password, 
+      full_name, 
+      organization_name,
+      contact_email,
+      contact_phone 
+    } = req.body;
+    
+    // Validation
+    if (!email || !password || !full_name || !organization_name) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    if (!validateEmail(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ error: passwordValidation.error });
+    }
+    
+    // Check if email exists
+    const existingUser = await db.getUserByEmail(email);
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email already registered' });
+    }
+    
+    // Create organization
+    const organization = await db.createOrganization(
+      organization_name,
+      contact_email || email,
+      contact_phone,
+      null
+    );
+    
+    // Create user
+    const passwordHash = await hashPassword(password);
+    const user = await db.createUser(
+      email,
+      passwordHash,
+      full_name,
+      'user',  // Default role
+      organization.id
+    );
+    
+    // Generate token
+    const token = generateToken(user);
+    
+    // Remove password hash from response
+    delete user.password_hash;
+    
+    res.json({ user, token });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
+    }
+    
+    // Get user
+    const user = await db.getUserByEmail(email);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    if (!user.is_active) {
+      return res.status(403).json({ error: 'Account is disabled' });
+    }
+    
+    // Verify password
+    const isValid = await comparePassword(password, user.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Update last login
+    await db.updateUserLastLogin(user.id);
+    
+    // Generate token
+    const token = generateToken(user);
+    
+    // Remove password hash from response
+    delete user.password_hash;
+    
+    res.json({ user, token });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Get current user info
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const user = await db.getUserById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    delete user.password_hash;
+    res.json(user);
+  } catch (error) {
+    console.error('Error fetching user:', error);
+    res.status(500).json({ error: 'Failed to fetch user' });
+  }
+});
+
+// ============================================
+// ADMIN - ORGANIZATIONS
+// ============================================
+
+// Get all organizations (admin only)
+app.get('/api/admin/organizations', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const organizations = await db.getAllOrganizations();
+    res.json(organizations);
+  } catch (error) {
+    console.error('Error fetching organizations:', error);
+    res.status(500).json({ error: 'Failed to fetch organizations' });
+  }
+});
+
+// Create organization (admin only)
+app.post('/api/admin/organizations', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { name, contact_email, contact_phone, address } = req.body;
+    
+    if (!name) {
+      return res.status(400).json({ error: 'Organization name is required' });
+    }
+    
+    const organization = await db.createOrganization(name, contact_email, contact_phone, address);
+    res.json(organization);
+  } catch (error) {
+    console.error('Error creating organization:', error);
+    res.status(500).json({ error: 'Failed to create organization' });
+  }
+});
+
+// ============================================
+// ADMIN - USERS
+// ============================================
+
+// Get all users (admin only)
+app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const users = await db.getAllUsers();
+    // Remove password hashes
+    users.forEach(user => delete user.password_hash);
+    res.json(users);
+  } catch (error) {
+    console.error('Error fetching users:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// ============================================
 // DEVICES
 // ============================================
 
-// Get all devices
-app.get('/api/devices', async (req, res) => {
+// Get all devices (filtered by organization for users)
+app.get('/api/devices', authMiddleware, async (req, res) => {
   try {
-    const devices = await db.getAllDevices();
+    // Admin sees all devices, users see only their organization's devices
+    const organizationId = req.user.role === 'admin' ? null : req.user.organization_id;
+    const devices = await db.getAllDevices(organizationId);
     res.json(devices);
   } catch (error) {
     console.error('Error fetching devices:', error);
@@ -80,8 +264,8 @@ app.get('/api/devices/:name', async (req, res) => {
   }
 });
 
-// Add or update device (ESP32 auto-registration)
-app.post('/api/devices', async (req, res) => {
+// Add or update device (authenticated - organization assigned)
+app.post('/api/devices', authMiddleware, async (req, res) => {
   try {
     const { name, ip_address, description } = req.body;
     
@@ -89,7 +273,10 @@ app.post('/api/devices', async (req, res) => {
       return res.status(400).json({ error: 'Device name is required' });
     }
 
-    const device = await db.upsertDevice(name, ip_address, description);
+    // Users can only add devices to their organization
+    const organizationId = req.user.organization_id;
+    
+    const device = await db.upsertDevice(name, organizationId, ip_address, description);
     
     // Broadcast to WebSocket clients
     broadcast({ type: 'device_update', data: device });
@@ -98,6 +285,33 @@ app.post('/api/devices', async (req, res) => {
   } catch (error) {
     console.error('Error upserting device:', error);
     res.status(500).json({ error: 'Failed to save device' });
+  }
+});
+
+// Public endpoint for ESP32 auto-registration (with device token)
+app.post('/api/devices/register', async (req, res) => {
+  try {
+    const { name, ip_address, description, device_token } = req.body;
+    
+    if (!name) {
+      return res.status(400).json({ error: 'Device name is required' });
+    }
+    
+    // TODO: Implement device token validation
+    // For now, device updates existing records only
+    const existing = await db.getDeviceByName(name);
+    if (!existing) {
+      return res.status(404).json({ error: 'Device not found. Please register device through web interface first.' });
+    }
+    
+    const device = await db.upsertDevice(name, existing.organization_id, ip_address, description);
+    
+    broadcast({ type: 'device_update', data: device });
+    
+    res.json(device);
+  } catch (error) {
+    console.error('Error registering device:', error);
+    res.status(500).json({ error: 'Failed to register device' });
   }
 });
 
@@ -116,16 +330,20 @@ app.delete('/api/devices/:id', async (req, res) => {
 // SENSOR DATA
 // ============================================
 
-// Get sensor data (with filters)
-app.get('/api/sensor-data', async (req, res) => {
+// Get sensor data (filtered by organization)
+app.get('/api/sensor-data', authMiddleware, async (req, res) => {
   try {
     const { device_name, start_date, end_date, limit = 1000 } = req.query;
+    
+    // Filter by organization for non-admin users
+    const organizationId = req.user.role === 'admin' ? null : req.user.organization_id;
     
     const data = await db.getSensorData({
       device_name,
       start_date,
       end_date,
-      limit: parseInt(limit)
+      limit: parseInt(limit),
+      organizationId
     });
     
     res.json(data);
@@ -149,7 +367,7 @@ app.get('/api/sensor-data/latest/:device_name', async (req, res) => {
   }
 });
 
-// Add sensor data (from ESP32)
+// Add sensor data (from ESP32 - public endpoint with device lookup)
 app.post('/api/sensor-data', async (req, res) => {
   try {
     const { device_name, radiation, temperature1, temperature2 } = req.body;
@@ -158,8 +376,11 @@ app.post('/api/sensor-data', async (req, res) => {
       return res.status(400).json({ error: 'Device name is required' });
     }
 
-    // Auto-register device if not exists
-    await db.upsertDevice(device_name);
+    // Device must exist (registered through web interface)
+    const device = await db.getDeviceByName(device_name);
+    if (!device) {
+      return res.status(404).json({ error: 'Device not found. Please register device first.' });
+    }
     
     // Insert sensor data
     const data = await db.insertSensorData(
@@ -302,12 +523,14 @@ app.put('/api/settings/:key', async (req, res) => {
 // STATISTICS
 // ============================================
 
-// Get statistics
-app.get('/api/statistics', async (req, res) => {
+// Get statistics (filtered by organization)
+app.get('/api/statistics', authMiddleware, async (req, res) => {
   try {
     const { device_name, start_date, end_date } = req.query;
     
-    const stats = await db.getStatistics(device_name, start_date, end_date);
+    const organizationId = req.user.role === 'admin' ? null : req.user.organization_id;
+    
+    const stats = await db.getStatistics(device_name, start_date, end_date, organizationId);
     res.json(stats);
   } catch (error) {
     console.error('Error fetching statistics:', error);
@@ -319,16 +542,19 @@ app.get('/api/statistics', async (req, res) => {
 // DATA EXPORT
 // ============================================
 
-// Export data as CSV
-app.get('/api/export/csv', async (req, res) => {
+// Export data as CSV (filtered by organization)
+app.get('/api/export/csv', authMiddleware, async (req, res) => {
   try {
     const { device_name, start_date, end_date } = req.query;
+    
+    const organizationId = req.user.role === 'admin' ? null : req.user.organization_id;
     
     const data = await db.getSensorData({
       device_name,
       start_date,
       end_date,
-      limit: 1000000  // No limit for export
+      limit: 1000000,  // No limit for export
+      organizationId
     });
     
     // Generate CSV
