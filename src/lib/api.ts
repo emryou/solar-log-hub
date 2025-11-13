@@ -117,6 +117,14 @@ class ApiClient {
   async updateSetting(key: string, value: string) {
     return this.request<Setting>(`/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) });
   }
+
+  async getOrganizations() {
+    return this.request<any[]>('/organizations');
+  }
+
+  async getUsers() {
+    return this.request<any[]>('/users');
+  }
 }
 
 export const apiClient = new ApiClient();
