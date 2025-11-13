@@ -66,25 +66,42 @@ class Database {
         FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
       )`,
       
-      // Sensor data table
-      `CREATE TABLE IF NOT EXISTS sensor_data (
+      // Sensors table (her cihaz altında birden fazla sensör)
+      `CREATE TABLE IF NOT EXISTS sensors (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        device_name TEXT NOT NULL,
-        radiation REAL,
-        temperature1 REAL,
-        temperature2 REAL,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (device_name) REFERENCES devices(name) ON DELETE CASCADE
+        device_id INTEGER NOT NULL,
+        sensor_name TEXT NOT NULL,
+        sensor_type TEXT NOT NULL,
+        unit TEXT,
+        is_active INTEGER DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE,
+        UNIQUE(device_id, sensor_name)
       )`,
       
-      // Modbus maps table
+      // Modbus maps table (her sensör için ayrı Modbus yapılandırması)
       `CREATE TABLE IF NOT EXISTS modbus_maps (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sensor_name TEXT UNIQUE NOT NULL,
+        sensor_id INTEGER NOT NULL,
         modbus_address INTEGER NOT NULL,
-        registers TEXT NOT NULL,
+        register_type TEXT NOT NULL,
+        data_type TEXT NOT NULL,
+        scale_factor REAL DEFAULT 1.0,
+        offset REAL DEFAULT 0.0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE,
+        CHECK (register_type IN ('holding', 'input', 'coil', 'discrete')),
+        CHECK (data_type IN ('int16', 'uint16', 'int32', 'uint32', 'float32'))
+      )`,
+      
+      // Sensor data table (gerçek sensör verisi)
+      `CREATE TABLE IF NOT EXISTS sensor_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sensor_id INTEGER NOT NULL,
+        value REAL NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
       )`,
       
       // Settings table
@@ -96,14 +113,20 @@ class Database {
       )`,
       
       // Indexes for performance
-      `CREATE INDEX IF NOT EXISTS idx_sensor_data_device 
-       ON sensor_data(device_name)`,
+      `CREATE INDEX IF NOT EXISTS idx_sensor_data_sensor 
+       ON sensor_data(sensor_id)`,
       
       `CREATE INDEX IF NOT EXISTS idx_sensor_data_timestamp 
        ON sensor_data(timestamp DESC)`,
       
       `CREATE INDEX IF NOT EXISTS idx_devices_active 
-       ON devices(is_active)`
+       ON devices(is_active)`,
+       
+      `CREATE INDEX IF NOT EXISTS idx_sensors_device 
+       ON sensors(device_id)`,
+       
+      `CREATE INDEX IF NOT EXISTS idx_sensors_active 
+       ON sensors(is_active)`
     ];
 
     for (const sql of tables) {
@@ -348,21 +371,88 @@ class Database {
   }
 
   // ============================================
+  // SENSORS
+  // ============================================
+
+  async createSensor(deviceId, sensorName, sensorType, unit = null) {
+    const result = await this.run(
+      `INSERT INTO sensors (device_id, sensor_name, sensor_type, unit) 
+       VALUES (?, ?, ?, ?)`,
+      [deviceId, sensorName, sensorType, unit]
+    );
+    
+    return this.getSensorById(result.id);
+  }
+
+  async getSensorById(id) {
+    return this.get(
+      `SELECT s.*, d.name as device_name, d.organization_id
+       FROM sensors s
+       LEFT JOIN devices d ON s.device_id = d.id
+       WHERE s.id = ?`,
+      [id]
+    );
+  }
+
+  async getSensorsByDevice(deviceId) {
+    return this.all(
+      `SELECT s.*, 
+              (SELECT COUNT(*) FROM modbus_maps WHERE sensor_id = s.id) as modbus_config_count
+       FROM sensors s
+       WHERE s.device_id = ?
+       ORDER BY s.sensor_name ASC`,
+      [deviceId]
+    );
+  }
+
+  async getAllSensorsWithDetails() {
+    return this.all(
+      `SELECT s.*, d.name as device_name, d.organization_id,
+              (SELECT COUNT(*) FROM modbus_maps WHERE sensor_id = s.id) as modbus_config_count,
+              (SELECT COUNT(*) FROM sensor_data WHERE sensor_id = s.id) as data_count
+       FROM sensors s
+       LEFT JOIN devices d ON s.device_id = d.id
+       ORDER BY d.name, s.sensor_name ASC`
+    );
+  }
+
+  async updateSensor(id, sensorName, sensorType, unit, isActive) {
+    await this.run(
+      `UPDATE sensors 
+       SET sensor_name = ?, sensor_type = ?, unit = ?, is_active = ?
+       WHERE id = ?`,
+      [sensorName, sensorType, unit, isActive, id]
+    );
+    
+    return this.getSensorById(id);
+  }
+
+  async deleteSensor(id) {
+    return this.run(
+      `DELETE FROM sensors WHERE id = ?`,
+      [id]
+    );
+  }
+
+  // ============================================
   // SENSOR DATA
   // ============================================
 
-  async insertSensorData(device_name, radiation, temperature1, temperature2) {
+  async insertSensorData(sensorId, value) {
     const result = await this.run(
-      `INSERT INTO sensor_data (device_name, radiation, temperature1, temperature2) 
-       VALUES (?, ?, ?, ?)`,
-      [device_name, radiation, temperature1, temperature2]
+      `INSERT INTO sensor_data (sensor_id, value) 
+       VALUES (?, ?)`,
+      [sensorId, value]
     );
     
     // Update device last_seen
-    await this.run(
-      `UPDATE devices SET last_seen = CURRENT_TIMESTAMP WHERE name = ?`,
-      [device_name]
-    );
+    const sensor = await this.getSensorById(sensorId);
+    if (sensor) {
+      await this.run(
+        `UPDATE devices SET last_seen = CURRENT_TIMESTAMP WHERE id = ?`,
+        [sensor.device_id]
+      );
+    }
     
     return this.get(
       `SELECT * FROM sensor_data WHERE id = ?`,
@@ -370,10 +460,38 @@ class Database {
     );
   }
 
-  async getSensorData({ device_name, start_date, end_date, limit = 1000, organizationId = null }) {
-    let sql = `SELECT sd.*, d.organization_id 
-               FROM sensor_data sd 
-               LEFT JOIN devices d ON sd.device_name = d.name 
+  async bulkInsertSensorData(dataArray) {
+    const stmt = this.db.prepare(
+      `INSERT INTO sensor_data (sensor_id, value, timestamp) VALUES (?, ?, ?)`
+    );
+    
+    for (const data of dataArray) {
+      stmt.run(data.sensor_id, data.value, data.timestamp || new Date().toISOString());
+    }
+    
+    stmt.finalize();
+    
+    // Update device last_seen for all affected devices
+    const deviceIds = new Set();
+    for (const data of dataArray) {
+      const sensor = await this.getSensorById(data.sensor_id);
+      if (sensor) deviceIds.add(sensor.device_id);
+    }
+    
+    for (const deviceId of deviceIds) {
+      await this.run(
+        `UPDATE devices SET last_seen = CURRENT_TIMESTAMP WHERE id = ?`,
+        [deviceId]
+      );
+    }
+  }
+
+  async getSensorData({ deviceId, sensorId, start_date, end_date, limit = 1000, organizationId = null }) {
+    let sql = `SELECT sd.*, s.sensor_name, s.sensor_type, s.unit, 
+                      d.name as device_name, d.organization_id
+               FROM sensor_data sd
+               LEFT JOIN sensors s ON sd.sensor_id = s.id
+               LEFT JOIN devices d ON s.device_id = d.id
                WHERE 1=1`;
     const params = [];
 
@@ -382,9 +500,14 @@ class Database {
       params.push(organizationId);
     }
 
-    if (device_name) {
-      sql += ` AND sd.device_name = ?`;
-      params.push(device_name);
+    if (deviceId) {
+      sql += ` AND s.device_id = ?`;
+      params.push(deviceId);
+    }
+
+    if (sensorId) {
+      sql += ` AND sd.sensor_id = ?`;
+      params.push(sensorId);
     }
 
     if (start_date) {
@@ -403,31 +526,48 @@ class Database {
     return this.all(sql, params);
   }
 
-  async getLatestSensorData(device_name) {
-    return this.get(
-      `SELECT * FROM sensor_data 
-       WHERE device_name = ? 
-       ORDER BY timestamp DESC 
-       LIMIT 1`,
-      [device_name]
+  async getLatestSensorData(deviceId) {
+    return this.all(
+      `SELECT sd.*, s.sensor_name, s.sensor_type, s.unit
+       FROM sensor_data sd
+       INNER JOIN sensors s ON sd.sensor_id = s.id
+       WHERE s.device_id = ? AND s.is_active = 1
+       AND sd.id IN (
+         SELECT MAX(id) FROM sensor_data 
+         WHERE sensor_id IN (SELECT id FROM sensors WHERE device_id = ?)
+         GROUP BY sensor_id
+       )
+       ORDER BY s.sensor_name ASC`,
+      [deviceId, deviceId]
     );
   }
 
-  async getStatistics(device_name, start_date, end_date, organizationId = null) {
+  async getLatestSensorDataBySensorId(sensorId) {
+    return this.get(
+      `SELECT sd.*, s.sensor_name, s.sensor_type, s.unit
+       FROM sensor_data sd
+       INNER JOIN sensors s ON sd.sensor_id = s.id
+       WHERE sd.sensor_id = ?
+       ORDER BY sd.timestamp DESC 
+       LIMIT 1`,
+      [sensorId]
+    );
+  }
+
+  async getStatistics(deviceId = null, sensorId = null, start_date = null, end_date = null, organizationId = null) {
     let sql = `
       SELECT 
         COUNT(*) as total_records,
-        AVG(sd.radiation) as avg_radiation,
-        MAX(sd.radiation) as max_radiation,
-        MIN(sd.radiation) as min_radiation,
-        AVG(sd.temperature1) as avg_temp1,
-        MAX(sd.temperature1) as max_temp1,
-        MIN(sd.temperature1) as min_temp1,
-        AVG(sd.temperature2) as avg_temp2,
-        MAX(sd.temperature2) as max_temp2,
-        MIN(sd.temperature2) as min_temp2
+        AVG(sd.value) as avg_value,
+        MAX(sd.value) as max_value,
+        MIN(sd.value) as min_value,
+        s.sensor_name,
+        s.sensor_type,
+        s.unit,
+        d.name as device_name
       FROM sensor_data sd
-      LEFT JOIN devices d ON sd.device_name = d.name
+      LEFT JOIN sensors s ON sd.sensor_id = s.id
+      LEFT JOIN devices d ON s.device_id = d.id
       WHERE 1=1
     `;
     const params = [];
@@ -437,9 +577,14 @@ class Database {
       params.push(organizationId);
     }
 
-    if (device_name) {
-      sql += ` AND sd.device_name = ?`;
-      params.push(device_name);
+    if (deviceId) {
+      sql += ` AND s.device_id = ?`;
+      params.push(deviceId);
+    }
+
+    if (sensorId) {
+      sql += ` AND sd.sensor_id = ?`;
+      params.push(sensorId);
     }
 
     if (start_date) {
@@ -452,7 +597,9 @@ class Database {
       params.push(end_date);
     }
 
-    return this.get(sql, params);
+    sql += ` GROUP BY sd.sensor_id`;
+
+    return this.all(sql, params);
   }
 
   // ============================================
@@ -461,42 +608,67 @@ class Database {
 
   async getAllModbusMaps() {
     return this.all(
-      `SELECT * FROM modbus_maps ORDER BY sensor_name ASC`
+      `SELECT mm.*, s.sensor_name, s.sensor_type, d.name as device_name
+       FROM modbus_maps mm
+       LEFT JOIN sensors s ON mm.sensor_id = s.id
+       LEFT JOIN devices d ON s.device_id = d.id
+       ORDER BY d.name, s.sensor_name ASC`
     );
   }
 
   async getModbusMapById(id) {
-    const map = await this.get(
-      `SELECT * FROM modbus_maps WHERE id = ?`,
+    return this.get(
+      `SELECT mm.*, s.sensor_name, s.sensor_type, d.name as device_name
+       FROM modbus_maps mm
+       LEFT JOIN sensors s ON mm.sensor_id = s.id
+       LEFT JOIN devices d ON s.device_id = d.id
+       WHERE mm.id = ?`,
       [id]
     );
-    
-    if (map && map.registers) {
-      map.registers = JSON.parse(map.registers);
-    }
-    
-    return map;
   }
 
-  async insertModbusMap(sensor_name, modbus_address, registers) {
+  async getModbusMapBySensor(sensorId) {
+    return this.get(
+      `SELECT mm.*, s.sensor_name, s.sensor_type
+       FROM modbus_maps mm
+       LEFT JOIN sensors s ON mm.sensor_id = s.id
+       WHERE mm.sensor_id = ?`,
+      [sensorId]
+    );
+  }
+
+  async getModbusMapsByDevice(deviceId) {
+    return this.all(
+      `SELECT mm.*, s.sensor_name, s.sensor_type
+       FROM modbus_maps mm
+       INNER JOIN sensors s ON mm.sensor_id = s.id
+       WHERE s.device_id = ?
+       ORDER BY mm.modbus_address ASC`,
+      [deviceId]
+    );
+  }
+
+  async insertModbusMap(sensorId, modbusAddress, registerType, dataType, scaleFactor = 1.0, offset = 0.0) {
     const result = await this.run(
-      `INSERT INTO modbus_maps (sensor_name, modbus_address, registers) 
-       VALUES (?, ?, ?)`,
-      [sensor_name, modbus_address, JSON.stringify(registers)]
+      `INSERT INTO modbus_maps (sensor_id, modbus_address, register_type, data_type, scale_factor, offset) 
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [sensorId, modbusAddress, registerType, dataType, scaleFactor, offset]
     );
     
     return this.getModbusMapById(result.id);
   }
 
-  async updateModbusMap(id, sensor_name, modbus_address, registers) {
+  async updateModbusMap(id, modbusAddress, registerType, dataType, scaleFactor, offset) {
     await this.run(
       `UPDATE modbus_maps 
-       SET sensor_name = ?, 
-           modbus_address = ?, 
-           registers = ?,
+       SET modbus_address = ?, 
+           register_type = ?, 
+           data_type = ?,
+           scale_factor = ?,
+           offset = ?,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [sensor_name, modbus_address, JSON.stringify(registers), id]
+      [modbusAddress, registerType, dataType, scaleFactor, offset, id]
     );
     
     return this.getModbusMapById(id);

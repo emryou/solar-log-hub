@@ -1,205 +1,121 @@
-// API Client for Solar Monitoring System
-// IMPORTANT: Backend Raspberry Pi'de çalışmalı!
-// Raspberry Pi IP'sini buraya yazın (örnek: http://192.168.1.100:5000/api)
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000/api';
+
+export interface Device {
+  id: number;
+  name: string;
+  organization_id: number;
+  ip_address?: string;
+  description?: string;
+  last_seen?: string;
+}
+
+export interface Sensor {
+  id: number;
+  device_id: number;
+  sensor_name: string;
+  sensor_type: string;
+  unit?: string;
+  is_active: number;
+  modbus_config_count?: number;
+}
+
+export interface ModbusMap {
+  id: number;
+  sensor_id: number;
+  modbus_address: number;
+  register_type: string;
+  data_type: string;
+  scale_factor: number;
+  offset: number;
+  sensor_name?: string;
+}
+
+export interface Setting {
+  key: string;
+  value: string;
+  description?: string;
+}
 
 class ApiClient {
-  private baseUrl: string;
-  private token: string | null;
-
-  constructor(baseUrl: string = API_BASE_URL) {
-    this.baseUrl = baseUrl;
-    this.token = localStorage.getItem('auth_token');
-  }
+  private baseUrl = API_BASE_URL;
+  private token: string | null = localStorage.getItem('auth_token');
 
   setToken(token: string | null) {
     this.token = token;
-    if (token) {
-      localStorage.setItem('auth_token', token);
-    } else {
-      localStorage.removeItem('auth_token');
-    }
+    if (token) localStorage.setItem('auth_token', token);
+    else localStorage.removeItem('auth_token');
   }
 
-  private async request<T>(
-    endpoint: string,
-    options: RequestInit = {}
-  ): Promise<T> {
-    const headers: HeadersInit = {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    };
-
-    if (this.token) {
-      headers['Authorization'] = `Bearer ${this.token}`;
-    }
-
-    const response = await fetch(`${this.baseUrl}${endpoint}`, {
-      ...options,
-      headers,
-    });
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: 'Request failed' }));
-      throw new Error(error.error || `HTTP ${response.status}`);
-    }
-
+  private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+    const headers: HeadersInit = { 'Content-Type': 'application/json', ...options.headers };
+    if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+    const response = await fetch(`${this.baseUrl}${endpoint}`, { ...options, headers });
+    if (!response.ok) throw new Error('Request failed');
     return response.json();
   }
 
-  // Authentication
   async login(email: string, password: string) {
-    return this.request<{ user: any; token: string }>('/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ email, password }),
-    });
+    return this.request<any>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
   }
 
-  async register(data: {
-    email: string;
-    password: string;
-    full_name: string;
-    organization_name: string;
-    contact_email?: string;
-    contact_phone?: string;
-  }) {
-    return this.request<{ user: any; token: string }>('/auth/register', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
+  async register(data: any) {
+    return this.request<any>('/auth/register', { method: 'POST', body: JSON.stringify(data) });
   }
 
   async getCurrentUser() {
     return this.request<any>('/auth/me');
   }
 
-  // Devices
   async getDevices() {
-    return this.request<any[]>('/devices');
+    return this.request<Device[]>('/devices');
   }
 
-  async createDevice(data: { name: string; ip_address?: string; description?: string }) {
-    return this.request<any>('/devices', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
+  async createDevice(data: any) {
+    return this.request<Device>('/devices', { method: 'POST', body: JSON.stringify(data) });
   }
 
   async deleteDevice(id: number) {
-    return this.request<{ success: boolean }>(`/devices/${id}`, {
-      method: 'DELETE',
-    });
+    return this.request<any>(`/devices/${id}`, { method: 'DELETE' });
   }
 
-  // Sensor Data
-  async getSensorData(params: {
-    device_name?: string;
-    start_date?: string;
-    end_date?: string;
-    limit?: number;
-  }) {
-    const query = new URLSearchParams(
-      Object.entries(params).filter(([_, v]) => v !== undefined) as [string, string][]
-    );
-    return this.request<any[]>(`/sensor-data?${query}`);
+  async getSensorsByDevice(deviceId: number) {
+    return this.request<Sensor[]>(`/devices/${deviceId}/sensors`);
   }
 
-  async getLatestSensorData(deviceName: string) {
-    return this.request<any>(`/sensor-data/latest/${deviceName}`);
+  async createSensor(deviceId: number, data: any) {
+    return this.request<Sensor>(`/devices/${deviceId}/sensors`, { method: 'POST', body: JSON.stringify(data) });
   }
 
-  // Statistics
-  async getStatistics(params: {
-    device_name?: string;
-    start_date?: string;
-    end_date?: string;
-  }) {
-    const query = new URLSearchParams(
-      Object.entries(params).filter(([_, v]) => v !== undefined) as [string, string][]
-    );
-    return this.request<any>(`/statistics?${query}`);
+  async deleteSensor(id: number) {
+    return this.request<any>(`/sensors/${id}`, { method: 'DELETE' });
   }
 
-  // Modbus Configuration
+  async getLatestSensorData(deviceId: number) {
+    return this.request<any[]>(`/devices/${deviceId}/latest`);
+  }
+
   async getModbusMaps() {
-    return this.request<any[]>('/modbus-maps');
+    return this.request<ModbusMap[]>('/modbus-maps');
   }
 
-  async createModbusMap(data: any) {
-    return this.request<any>('/modbus-maps', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
+  async createModbusMap(sensorId: number, data: any) {
+    return this.request<ModbusMap>(`/sensors/${sensorId}/modbus-map`, { method: 'POST', body: JSON.stringify(data) });
   }
 
   async updateModbusMap(id: number, data: any) {
-    return this.request<any>(`/modbus-maps/${id}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    });
+    return this.request<ModbusMap>(`/modbus-maps/${id}`, { method: 'PUT', body: JSON.stringify(data) });
   }
 
   async deleteModbusMap(id: number) {
-    return this.request<{ success: boolean }>(`/modbus-maps/${id}`, {
-      method: 'DELETE',
-    });
+    return this.request<any>(`/modbus-maps/${id}`, { method: 'DELETE' });
   }
 
-  // Settings
   async getSettings() {
-    return this.request<any[]>('/settings');
+    return this.request<Setting[]>('/settings');
   }
 
   async updateSetting(key: string, value: string) {
-    return this.request<any>(`/settings/${key}`, {
-      method: 'PUT',
-      body: JSON.stringify({ value }),
-    });
-  }
-
-  // Admin - Organizations
-  async getOrganizations() {
-    return this.request<any[]>('/admin/organizations');
-  }
-
-  async createOrganization(data: any) {
-    return this.request<any>('/admin/organizations', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-  }
-
-  // Admin - Users
-  async getUsers() {
-    return this.request<any[]>('/admin/users');
-  }
-
-  // Export
-  async exportCsv(params: {
-    device_name?: string;
-    start_date?: string;
-    end_date?: string;
-  }) {
-    const query = new URLSearchParams(
-      Object.entries(params).filter(([_, v]) => v !== undefined) as [string, string][]
-    );
-    const response = await fetch(`${this.baseUrl}/export/csv?${query}`, {
-      headers: this.token ? { Authorization: `Bearer ${this.token}` } : {},
-    });
-    
-    if (!response.ok) {
-      throw new Error('Export failed');
-    }
-    
-    const blob = await response.blob();
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `sensor-data-${Date.now()}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    window.URL.revokeObjectURL(url);
-    document.body.removeChild(a);
+    return this.request<Setting>(`/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) });
   }
 }
 

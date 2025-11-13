@@ -327,19 +327,99 @@ app.delete('/api/devices/:id', async (req, res) => {
 });
 
 // ============================================
+// SENSORS
+// ============================================
+
+// Get all sensors with details
+app.get('/api/sensors', authMiddleware, async (req, res) => {
+  try {
+    const sensors = await db.getAllSensorsWithDetails();
+    
+    // Filter by organization for non-admin users
+    const filteredSensors = req.user.role === 'admin' 
+      ? sensors 
+      : sensors.filter(s => s.organization_id === req.user.organization_id);
+    
+    res.json(filteredSensors);
+  } catch (error) {
+    console.error('Error fetching sensors:', error);
+    res.status(500).json({ error: 'Failed to fetch sensors' });
+  }
+});
+
+// Get sensors by device
+app.get('/api/devices/:deviceId/sensors', async (req, res) => {
+  try {
+    const sensors = await db.getSensorsByDevice(req.params.deviceId);
+    res.json(sensors);
+  } catch (error) {
+    console.error('Error fetching device sensors:', error);
+    res.status(500).json({ error: 'Failed to fetch device sensors' });
+  }
+});
+
+// Create sensor
+app.post('/api/devices/:deviceId/sensors', authMiddleware, async (req, res) => {
+  try {
+    const { sensor_name, sensor_type, unit } = req.body;
+    const deviceId = req.params.deviceId;
+    
+    if (!sensor_name || !sensor_type) {
+      return res.status(400).json({ error: 'Sensor name and type are required' });
+    }
+    
+    const sensor = await db.createSensor(deviceId, sensor_name, sensor_type, unit);
+    res.json(sensor);
+  } catch (error) {
+    console.error('Error creating sensor:', error);
+    res.status(500).json({ error: 'Failed to create sensor' });
+  }
+});
+
+// Update sensor
+app.put('/api/sensors/:id', authMiddleware, async (req, res) => {
+  try {
+    const { sensor_name, sensor_type, unit, is_active } = req.body;
+    const sensor = await db.updateSensor(
+      req.params.id,
+      sensor_name,
+      sensor_type,
+      unit,
+      is_active
+    );
+    res.json(sensor);
+  } catch (error) {
+    console.error('Error updating sensor:', error);
+    res.status(500).json({ error: 'Failed to update sensor' });
+  }
+});
+
+// Delete sensor
+app.delete('/api/sensors/:id', authMiddleware, async (req, res) => {
+  try {
+    await db.deleteSensor(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting sensor:', error);
+    res.status(500).json({ error: 'Failed to delete sensor' });
+  }
+});
+
+// ============================================
 // SENSOR DATA
 // ============================================
 
 // Get sensor data (filtered by organization)
 app.get('/api/sensor-data', authMiddleware, async (req, res) => {
   try {
-    const { device_name, start_date, end_date, limit = 1000 } = req.query;
+    const { deviceId, sensorId, start_date, end_date, limit = 1000 } = req.query;
     
     // Filter by organization for non-admin users
     const organizationId = req.user.role === 'admin' ? null : req.user.organization_id;
     
     const data = await db.getSensorData({
-      device_name,
+      deviceId: deviceId ? parseInt(deviceId) : null,
+      sensorId: sensorId ? parseInt(sensorId) : null,
       start_date,
       end_date,
       limit: parseInt(limit),
@@ -354,12 +434,9 @@ app.get('/api/sensor-data', authMiddleware, async (req, res) => {
 });
 
 // Get latest sensor data for a device
-app.get('/api/sensor-data/latest/:device_name', async (req, res) => {
+app.get('/api/devices/:deviceId/latest', async (req, res) => {
   try {
-    const data = await db.getLatestSensorData(req.params.device_name);
-    if (!data) {
-      return res.status(404).json({ error: 'No data found' });
-    }
+    const data = await db.getLatestSensorData(parseInt(req.params.deviceId));
     res.json(data);
   } catch (error) {
     console.error('Error fetching latest data:', error);
@@ -367,33 +444,57 @@ app.get('/api/sensor-data/latest/:device_name', async (req, res) => {
   }
 });
 
-// Add sensor data (from ESP32 - public endpoint with device lookup)
+// Get latest data for specific sensor
+app.get('/api/sensors/:sensorId/latest', async (req, res) => {
+  try {
+    const data = await db.getLatestSensorDataBySensorId(parseInt(req.params.sensorId));
+    if (!data) {
+      return res.status(404).json({ error: 'No data found' });
+    }
+    res.json(data);
+  } catch (error) {
+    console.error('Error fetching latest sensor data:', error);
+    res.status(500).json({ error: 'Failed to fetch latest sensor data' });
+  }
+});
+
+// Add sensor data (from ESP32 - public endpoint)
 app.post('/api/sensor-data', async (req, res) => {
   try {
-    const { device_name, radiation, temperature1, temperature2 } = req.body;
+    const { device_name, data } = req.body;
     
-    if (!device_name) {
-      return res.status(400).json({ error: 'Device name is required' });
+    if (!device_name || !data || !Array.isArray(data)) {
+      return res.status(400).json({ error: 'Device name and data array are required' });
     }
 
-    // Device must exist (registered through web interface)
+    // Device must exist
     const device = await db.getDeviceByName(device_name);
     if (!device) {
       return res.status(404).json({ error: 'Device not found. Please register device first.' });
     }
     
-    // Insert sensor data
-    const data = await db.insertSensorData(
-      device_name,
-      radiation,
-      temperature1,
-      temperature2
-    );
+    // Get all sensors for this device
+    const sensors = await db.getSensorsByDevice(device.id);
+    
+    // Insert data for each sensor
+    const results = [];
+    for (const item of data) {
+      const sensor = sensors.find(s => s.sensor_name === item.sensor_name);
+      if (sensor && sensor.is_active) {
+        const sensorData = await db.insertSensorData(sensor.id, item.value);
+        results.push(sensorData);
+      }
+    }
     
     // Broadcast to WebSocket clients
-    broadcast({ type: 'sensor_data', data });
+    broadcast({ 
+      type: 'sensor_data', 
+      device_name,
+      device_id: device.id,
+      data: results 
+    });
     
-    res.json(data);
+    res.json({ success: true, inserted: results.length });
   } catch (error) {
     console.error('Error inserting sensor data:', error);
     res.status(500).json({ error: 'Failed to insert sensor data' });
@@ -415,10 +516,21 @@ app.get('/api/modbus-maps', async (req, res) => {
   }
 });
 
-// Get Modbus map by ID
-app.get('/api/modbus-maps/:id', async (req, res) => {
+// Get Modbus maps by device
+app.get('/api/devices/:deviceId/modbus-maps', async (req, res) => {
   try {
-    const map = await db.getModbusMapById(req.params.id);
+    const maps = await db.getModbusMapsByDevice(parseInt(req.params.deviceId));
+    res.json(maps);
+  } catch (error) {
+    console.error('Error fetching device Modbus maps:', error);
+    res.status(500).json({ error: 'Failed to fetch device Modbus maps' });
+  }
+});
+
+// Get Modbus map by sensor
+app.get('/api/sensors/:sensorId/modbus-map', async (req, res) => {
+  try {
+    const map = await db.getModbusMapBySensor(parseInt(req.params.sensorId));
     if (!map) {
       return res.status(404).json({ error: 'Modbus map not found' });
     }
@@ -429,16 +541,24 @@ app.get('/api/modbus-maps/:id', async (req, res) => {
   }
 });
 
-// Create Modbus map
-app.post('/api/modbus-maps', async (req, res) => {
+// Create Modbus map for sensor
+app.post('/api/sensors/:sensorId/modbus-map', authMiddleware, async (req, res) => {
   try {
-    const { sensor_name, modbus_address, registers } = req.body;
+    const { modbus_address, register_type, data_type, scale_factor, offset } = req.body;
+    const sensorId = parseInt(req.params.sensorId);
     
-    if (!sensor_name || !modbus_address || !registers) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!modbus_address || !register_type || !data_type) {
+      return res.status(400).json({ error: 'Modbus address, register type, and data type are required' });
     }
-
-    const map = await db.insertModbusMap(sensor_name, modbus_address, registers);
+    
+    const map = await db.insertModbusMap(
+      sensorId,
+      modbus_address,
+      register_type,
+      data_type,
+      scale_factor || 1.0,
+      offset || 0.0
+    );
     res.json(map);
   } catch (error) {
     console.error('Error creating Modbus map:', error);
@@ -447,14 +567,16 @@ app.post('/api/modbus-maps', async (req, res) => {
 });
 
 // Update Modbus map
-app.put('/api/modbus-maps/:id', async (req, res) => {
+app.put('/api/modbus-maps/:id', authMiddleware, async (req, res) => {
   try {
-    const { sensor_name, modbus_address, registers } = req.body;
+    const { modbus_address, register_type, data_type, scale_factor, offset } = req.body;
     const map = await db.updateModbusMap(
-      req.params.id,
-      sensor_name,
+      parseInt(req.params.id),
       modbus_address,
-      registers
+      register_type,
+      data_type,
+      scale_factor,
+      offset
     );
     res.json(map);
   } catch (error) {
@@ -464,9 +586,9 @@ app.put('/api/modbus-maps/:id', async (req, res) => {
 });
 
 // Delete Modbus map
-app.delete('/api/modbus-maps/:id', async (req, res) => {
+app.delete('/api/modbus-maps/:id', authMiddleware, async (req, res) => {
   try {
-    await db.deleteModbusMap(req.params.id);
+    await db.deleteModbusMap(parseInt(req.params.id));
     res.json({ success: true });
   } catch (error) {
     console.error('Error deleting Modbus map:', error);
@@ -526,11 +648,17 @@ app.put('/api/settings/:key', async (req, res) => {
 // Get statistics (filtered by organization)
 app.get('/api/statistics', authMiddleware, async (req, res) => {
   try {
-    const { device_name, start_date, end_date } = req.query;
+    const { deviceId, sensorId, start_date, end_date } = req.query;
     
     const organizationId = req.user.role === 'admin' ? null : req.user.organization_id;
     
-    const stats = await db.getStatistics(device_name, start_date, end_date, organizationId);
+    const stats = await db.getStatistics(
+      deviceId ? parseInt(deviceId) : null,
+      sensorId ? parseInt(sensorId) : null,
+      start_date,
+      end_date,
+      organizationId
+    );
     res.json(stats);
   } catch (error) {
     console.error('Error fetching statistics:', error);
@@ -545,12 +673,13 @@ app.get('/api/statistics', authMiddleware, async (req, res) => {
 // Export data as CSV (filtered by organization)
 app.get('/api/export/csv', authMiddleware, async (req, res) => {
   try {
-    const { device_name, start_date, end_date } = req.query;
+    const { deviceId, sensorId, start_date, end_date } = req.query;
     
     const organizationId = req.user.role === 'admin' ? null : req.user.organization_id;
     
     const data = await db.getSensorData({
-      device_name,
+      deviceId: deviceId ? parseInt(deviceId) : null,
+      sensorId: sensorId ? parseInt(sensorId) : null,
       start_date,
       end_date,
       limit: 1000000,  // No limit for export
@@ -559,9 +688,9 @@ app.get('/api/export/csv', authMiddleware, async (req, res) => {
     
     // Generate CSV
     const csv = [
-      'Timestamp,Device Name,Radiation (W/m²),Temperature 1 (°C),Temperature 2 (°C)',
+      'Timestamp,Device Name,Sensor Name,Sensor Type,Value,Unit',
       ...data.map(row => 
-        `${row.timestamp},${row.device_name},${row.radiation || ''},${row.temperature1 || ''},${row.temperature2 || ''}`
+        `${row.timestamp},${row.device_name},${row.sensor_name},${row.sensor_type},${row.value},${row.unit || ''}`
       )
     ].join('\n');
     
