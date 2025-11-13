@@ -3,8 +3,8 @@ version: '3.8'
 services:
   backend:
     build:
-      context: ./docs/docker
-      dockerfile: Dockerfile
+      context: ./docs
+      dockerfile: docker/Dockerfile
     container_name: solar-backend
     restart: unless-stopped
     ports:
