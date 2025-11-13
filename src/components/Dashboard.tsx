@@ -1,46 +1,48 @@
+import { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { apiClient } from '@/lib/api';
 
 const Dashboard = () => {
+  const [devices, setDevices] = useState<any[]>([]);
+  const [latestData, setLatestData] = useState<any>({});
+
+  useEffect(() => {
+    loadData();
+    const interval = setInterval(loadData, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const loadData = async () => {
+    try {
+      const devs = await apiClient.getDevices();
+      setDevices(devs);
+      
+      for (const dev of devs) {
+        const data = await apiClient.getLatestSensorData(dev.id);
+        setLatestData(prev => ({ ...prev, [dev.id]: data }));
+      }
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
   return (
     <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-      <Card>
-        <CardHeader>
-          <CardTitle>Anlık Işınım</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="text-4xl font-bold">850.5 W/m²</div>
-          <p className="text-sm text-muted-foreground mt-2">ESP32-SOLAR-001</p>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Sıcaklık 1</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="text-4xl font-bold">45.2°C</div>
-          <p className="text-sm text-muted-foreground mt-2">Sensör Sıcaklığı</p>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Sıcaklık 2</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="text-4xl font-bold">43.8°C</div>
-          <p className="text-sm text-muted-foreground mt-2">Panel Sıcaklığı</p>
-        </CardContent>
-      </Card>
-
-      <Card className="md:col-span-2 lg:col-span-3">
-        <CardHeader>
-          <CardTitle>Grafik Görünümü</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="text-muted-foreground">API bağlantısı kurulduğunda gerçek zamanlı veriler gösterilecek.</p>
-        </CardContent>
-      </Card>
+      {devices.map(device => (
+        <Card key={device.id}>
+          <CardHeader>
+            <CardTitle>{device.name}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {latestData[device.id]?.map((sensor: any) => (
+              <div key={sensor.id} className="mb-2">
+                <div className="text-2xl font-bold">{sensor.value} {sensor.unit}</div>
+                <p className="text-sm text-muted-foreground">{sensor.sensor_name}</p>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      ))}
     </div>
   );
 };
